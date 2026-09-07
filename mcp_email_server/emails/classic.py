@@ -97,6 +97,101 @@ def _create_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
 _create_smtp_ssl_context = _create_ssl_context
 
 
+def _parse_ics(text: str) -> dict[str, Any] | None:
+    """Minimale, dependency-vrije iCalendar-parser: haalt de kern van de eerste VEVENT
+    (+ METHOD) uit een text/calendar-part, zodat agenda-invites niet stil verdwijnen."""
+    if not text or "BEGIN:VEVENT" not in text:
+        return None
+    # regel-unfolding (RFC 5545): een regel die met spatie/tab begint hoort bij de vorige
+    lines: list[str] = []
+    for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if ln[:1] in (" ", "\t") and lines:
+            lines[-1] += ln[1:]
+        else:
+            lines.append(ln)
+
+    def _unescape(v: str) -> str:
+        return (v.replace("\\n", " ").replace("\\N", " ").replace("\\,", ",")
+                .replace("\\;", ";").replace("\\\\", "\\").strip())
+
+    def _split(line: str):
+        if ":" not in line:
+            return "", {}, ""
+        head, value = line.split(":", 1)
+        segs = head.split(";")
+        params = {}
+        for p in segs[1:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                params[k.upper()] = v
+        return segs[0].upper(), params, value
+
+    def _person(params: dict, value: str) -> str:
+        cn = params.get("CN", "").strip('"')
+        mail = value.split(":")[-1].strip()  # strip mailto:
+        return f"{cn} <{mail}>" if cn else mail
+
+    def _fmt_dt(params: dict, value: str) -> str:
+        v = value.strip()
+        tz = params.get("TZID", "")
+        try:
+            if v.endswith("Z"):
+                return f"{v[0:4]}-{v[4:6]}-{v[6:8]} {v[9:11]}:{v[11:13]} UTC"
+            if "T" in v:
+                d, t = v.split("T")
+                return f"{d[0:4]}-{d[4:6]}-{d[6:8]} {t[0:2]}:{t[2:4]} {tz}".strip()
+            return f"{v[0:4]}-{v[4:6]}-{v[6:8]}"
+        except Exception:  # noqa: BLE001
+            return v
+
+    method = None
+    in_event = False
+    props: dict[str, Any] = {}
+    attendees: list[str] = []
+    for line in lines:
+        name, params, value = _split(line)
+        if name == "METHOD":
+            method = value.strip()
+        elif name == "BEGIN" and value.strip().upper() == "VEVENT":
+            in_event = True
+        elif name == "END" and value.strip().upper() == "VEVENT":
+            break  # alleen de eerste VEVENT
+        elif in_event:
+            if name == "SUMMARY":
+                props["summary"] = _unescape(value)
+            elif name == "DTSTART":
+                props["start"] = _fmt_dt(params, value)
+            elif name == "DTEND":
+                props["end"] = _fmt_dt(params, value)
+            elif name == "LOCATION":
+                props["location"] = _unescape(value)
+            elif name == "ORGANIZER":
+                props["organizer"] = _person(params, value)
+            elif name == "STATUS":
+                props["status"] = value.strip()
+            elif name == "ATTENDEE":
+                attendees.append(_person(params, value))
+    if not props and not attendees:
+        return None
+    invite: dict[str, Any] = {"method": method}
+    invite.update(props)
+    if attendees:
+        invite["attendees"] = attendees
+    return invite
+
+
+def _decode_part(part) -> str:
+    """Decodeer een MIME-part naar tekst (charset-tolerant)."""
+    payload = part.get_payload(decode=True)
+    if not payload:
+        return ""
+    charset = part.get_content_charset("utf-8") or "utf-8"
+    try:
+        return payload.decode(charset)
+    except (UnicodeDecodeError, LookupError):
+        return payload.decode("utf-8", errors="replace")
+
+
 class EmailClient:
     def __init__(self, email_server: EmailServer, sender: str | None = None):
         self.email_server = email_server
@@ -163,6 +258,7 @@ class EmailClient:
         body = ""
         html_body = ""  # Fallback if no text/plain
         attachments = []
+        ics_text = ""  # ruwe text/calendar (invite) — anders zou een invite stil verdwijnen
 
         def _strip_html(html: str) -> str:
             """Simple HTML to text conversion."""
@@ -193,6 +289,12 @@ class EmailClient:
                     filename = part.get_filename()
                     if filename:
                         attachments.append(filename)
+                        if filename.lower().endswith(".ics") and not ics_text:
+                            ics_text = _decode_part(part)  # invite als bijlage
+                # Kalender-invite (text/calendar) — meestal inline, geen attachment-disposition
+                elif content_type == "text/calendar":
+                    if not ics_text:
+                        ics_text = _decode_part(part)
                 # Handle text parts - prefer text/plain
                 elif content_type == "text/plain":
                     body_part = part.get_payload(decode=True)
@@ -227,9 +329,17 @@ class EmailClient:
                     text = payload.decode("utf-8", errors="replace")
 
                 body = _strip_html(text) if content_type == "text/html" else text
+                if content_type == "text/calendar":
+                    ics_text = text
         # TODO: Allow retrieving full email body
         if body and len(body) > MAX_BODY_LENGTH:
             body = body[:MAX_BODY_LENGTH] + "...[TRUNCATED]"
+        invite = None
+        if ics_text:
+            try:
+                invite = _parse_ics(ics_text)
+            except Exception:  # noqa: BLE001 — een kapotte invite mag het parsen nooit breken
+                invite = None
         return {
             "email_id": email_id or "",
             "message_id": message_id,
@@ -239,6 +349,7 @@ class EmailClient:
             "body": body,
             "date": date,
             "attachments": attachments,
+            "invite": invite,
         }
 
     @staticmethod
@@ -1177,6 +1288,7 @@ class ClassicEmailHandler(EmailHandler):
                             date=email_data["date"],
                             body=email_data["body"],
                             attachments=email_data["attachments"],
+                            invite=email_data.get("invite"),
                         )
                     )
                 else:

@@ -44,6 +44,7 @@ class EmailBodyResponse(EmailMetadata):
     """Single email body response - extends EmailMetadata with body content"""
 
     body: str
+    invite: dict[str, Any] | None = None  # geparste agenda-invite (VEVENT) indien aanwezig
 
 
 class EmailContentBatchResponse(BaseModel):
